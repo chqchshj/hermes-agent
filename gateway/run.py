@@ -28,7 +28,7 @@ from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Optional, Any, List
+from typing import Dict, Optional, Any, List, Tuple
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -1263,12 +1263,15 @@ class GatewayRunner:
             logger.warning("Failed to load prefill messages from %s: %s", path, e)
             return []
 
-    @staticmethod
-    def _load_ephemeral_system_prompt() -> str:
+    def _load_ephemeral_system_prompt(self, platform_key: str = "", bot_name: str = None) -> str:
         """Load ephemeral system prompt from config or env var.
-        
-        Checks HERMES_EPHEMERAL_SYSTEM_PROMPT env var first, then falls back to
-        agent.system_prompt in ~/.hermes/config.yaml.
+
+        Priority:
+        1. HERMES_EPHEMERAL_SYSTEM_PROMPT env var
+        2. platform_system_prompts[platform_key][bot_name] (if dict)
+        3. platform_system_prompts[platform_key]['default'] (if dict)
+        4. platform_system_prompts[platform_key] (if string)
+        5. agent.system_prompt
         """
         prompt = os.getenv("HERMES_EPHEMERAL_SYSTEM_PROMPT", "")
         if prompt:
@@ -1279,7 +1282,22 @@ class GatewayRunner:
             if cfg_path.exists():
                 with open(cfg_path, encoding="utf-8") as _f:
                     cfg = _y.safe_load(_f) or {}
-                return (cfg.get("agent", {}).get("system_prompt", "") or "").strip()
+                agent_cfg = cfg.get("agent", {})
+
+                # Check platform-specific prompts
+                plat_prompts = agent_cfg.get("platform_system_prompts", {})
+                if platform_key in plat_prompts:
+                    val = plat_prompts[platform_key]
+                    if isinstance(val, dict):
+                        if bot_name and bot_name in val:
+                            return (val[bot_name] or "").strip()
+                        if "default" in val:
+                            return (val["default"] or "").strip()
+                    elif isinstance(val, str):
+                        return val.strip()
+
+                # Fallback to global system prompt
+                return (agent_cfg.get("system_prompt", "") or "").strip()
         except Exception:
             pass
         return ""
@@ -2888,7 +2906,9 @@ class GatewayRunner:
 
         # Check pairing store (always checked, regardless of allowlists)
         platform_name = source.platform.value if source.platform else ""
+        logger.debug("Checking authorization for user %s on platform %s", user_id, platform_name)
         if self.pairing_store.is_approved(platform_name, user_id):
+            logger.debug("User %s is approved on platform %s", user_id, platform_name)
             return True
 
         # Check platform-specific and global allowlists
@@ -3008,7 +3028,7 @@ class GatewayRunner:
                     # Record rate limit so subsequent messages are silently ignored
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
-        
+
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
         # forwarded it to the user; now the user's reply goes back via
@@ -3485,6 +3505,15 @@ class GatewayRunner:
         if canonical == "voice":
             return await self._handle_voice_command(event)
 
+        if canonical == "syncmodel":
+            return await self._handle_syncmodel_command(event)
+
+        if canonical == "draw":
+            return await self._handle_draw_command(event)
+
+        if canonical == "drawmodel":
+            return await self._handle_drawmodel_command(event)
+
         if self._draining:
             return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."
 
@@ -3498,9 +3527,15 @@ class GatewayRunner:
                 quick_commands = {}
             if command in quick_commands:
                 qcmd = quick_commands[command]
+
                 if qcmd.get("type") == "exec":
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
+                        # Support {args} placeholder for user-supplied arguments
+                        if "{args}" in exec_cmd:
+                            import shlex as _shlex
+                            _raw_args = event.get_command_args().strip()
+                            exec_cmd = exec_cmd.replace("{args}", _shlex.quote(_raw_args) if _raw_args else "")
                         try:
                             proc = await asyncio.create_subprocess_shell(
                                 exec_cmd,
@@ -5789,24 +5824,24 @@ class GatewayRunner:
             if adapter:
                 self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=False)
             return (
-                "Voice mode enabled.\n"
-                "I'll reply with voice when you send voice messages.\n"
-                "Use /voice tts to get voice replies for all messages."
+                "语音模式已开启。\n"
+                "收到语音消息时我会用语音回复。\n"
+                "发送 /voice tts 可对所有消息启用语音回复。"
             )
         elif args in ("off", "disable"):
             self._voice_mode[chat_id] = "off"
             self._save_voice_modes()
             if adapter:
                 self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
-            return "Voice mode disabled. Text-only replies."
+            return "语音模式已关闭，仅文字回复。"
         elif args == "tts":
             self._voice_mode[chat_id] = "all"
             self._save_voice_modes()
             if adapter:
                 self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=False)
             return (
-                "Auto-TTS enabled.\n"
-                "All replies will include a voice message."
+                "自动语音已开启。\n"
+                "所有回复都会附带语音消息。"
             )
         elif args in ("channel", "join"):
             return await self._handle_voice_channel_join(event)
@@ -5815,9 +5850,9 @@ class GatewayRunner:
         elif args == "status":
             mode = self._voice_mode.get(chat_id, "off")
             labels = {
-                "off": "Off (text only)",
-                "voice_only": "On (voice reply to voice messages)",
-                "all": "TTS (voice reply to all messages)",
+                "off": "关闭（仅文字）",
+                "voice_only": "开启（语音消息回复语音）",
+                "all": "TTS（所有消息回复语音）",
             }
             # Append voice channel info if connected
             adapter = self.adapters.get(event.source.platform)
@@ -5826,15 +5861,15 @@ class GatewayRunner:
                 info = adapter.get_voice_channel_info(guild_id)
                 if info:
                     lines = [
-                        f"Voice mode: {labels.get(mode, mode)}",
-                        f"Voice channel: #{info['channel_name']}",
-                        f"Participants: {info['member_count']}",
+                        f"语音模式：{labels.get(mode, mode)}",
+                        f"语音频道：#{info['channel_name']}",
+                        f"参与者：{info['member_count']}",
                     ]
                     for m in info["members"]:
-                        status = " (speaking)" if m.get("is_speaking") else ""
+                        status = "（正在说话）" if m.get("is_speaking") else ""
                         lines.append(f"  - {m['display_name']}{status}")
                     return "\n".join(lines)
-            return f"Voice mode: {labels.get(mode, mode)}"
+            return f"语音模式：{labels.get(mode, mode)}"
         else:
             # Toggle: off → on, on/all → off
             current = self._voice_mode.get(chat_id, "off")
@@ -5843,13 +5878,13 @@ class GatewayRunner:
                 self._save_voice_modes()
                 if adapter:
                     self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=False)
-                return "Voice mode enabled."
+                return "语音模式已开启。"
             else:
                 self._voice_mode[chat_id] = "off"
                 self._save_voice_modes()
                 if adapter:
                     self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
-                return "Voice mode disabled."
+                return "语音模式已关闭。"
 
     async def _handle_voice_channel_join(self, event: MessageEvent) -> str:
         """Join the user's current Discord voice channel."""
@@ -7578,6 +7613,382 @@ class GatewayRunner:
 
         self._schedule_update_notification_watch()
         return "⚕ Starting Hermes update… I'll stream progress here."
+
+    # ── /syncmodel ──────────────────────────────────────────────────────────
+
+    async def _handle_syncmodel_command(self, event: MessageEvent) -> str:
+        """Handle /syncmodel — sync models from API providers to config."""
+        import subprocess
+
+        sync_script = Path.home() / ".hermes" / "scripts" / "sync_models_with_filter.py"
+        if not sync_script.exists():
+            return "✗ sync_models_with_filter.py 脚本不存在，请检查 ~/.hermes/scripts/"
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, str(sync_script),
+                "--base-url", "http://192.168.2.1:8090/v1",
+                "--api-key", "ah-9e38a9e12b469f739c826224cd247f0bb2e1b404cc95c58d6f8ab27874430120",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+            output = (stdout or b"").decode().strip()
+            if proc.returncode != 0:
+                err_text = (stderr or b"").decode().strip()
+                return f"✗ 同步失败 (exit={proc.returncode}):\n{err_text or output}"
+
+            summary = output if output else "模型同步完成（无变更）"
+
+            # Build notify script and spawn detached restart
+            notify_code = self._build_syncmodel_notify_script(summary)
+            notify_path = "/tmp/hermes_syncmodel_notify.py"
+            with open(notify_path, "w") as f:
+                f.write(notify_code)
+
+            cmd = (
+                "sleep 5 "
+                "&& systemctl restart hermes-gateway "
+                "&& sleep 3 "
+                f"&& python3 {notify_path}"
+            )
+            import subprocess as _sp
+            _sp.Popen(
+                ["setsid", "bash", "-lc", cmd],
+                start_new_session=True,
+                stdout=_sp.DEVNULL,
+                stderr=_sp.DEVNULL,
+            )
+
+            return f"✅ 模型同步完成，正在重启网关...\n\n{summary}"
+        except asyncio.TimeoutError:
+            return "✗ 同步超时（60s），请稍后重试"
+        except Exception as e:
+            return f"✗ 同步出错: {e}"
+
+    def _build_syncmodel_notify_script(self, summary: str) -> str:
+        """Build a standalone Python script that sends a Telegram notification."""
+        import textwrap
+
+        escaped_summary = summary.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
+        env_path = str(Path.home() / ".hermes" / ".env")
+
+        return textwrap.dedent(f"""\
+            #!/usr/bin/env python3
+            import os, urllib.request, urllib.parse
+            env_path = r"{env_path}"
+            token = ""
+            chat_id = ""
+            try:
+                with open(env_path) as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        if "=" in line:
+                            k, v = line.split("=", 1)
+                            k = k.strip()
+                            v = v.strip().strip('"').strip("'")
+                            if k == "TELEGRAM_BOT_TOKEN":
+                                token = v
+                            elif k == "TELEGRAM_HOME_CHANNEL":
+                                chat_id = v
+            except Exception:
+                pass
+            if not token or not chat_id:
+                raise SystemExit(0)
+            text = "✅ 网关已重启，模型同步完成！\\n\\n{escaped_summary}"
+            url = f"https://api.telegram.org/bot{{token}}/sendMessage"
+            data = urllib.parse.urlencode({{"chat_id": chat_id, "text": text}}).encode()
+            try:
+                urllib.request.urlopen(url, data=data, timeout=10)
+            except Exception:
+                pass
+        """)
+
+    # ── /draw & /drawmodel ──────────────────────────────────────────────────
+
+    def _get_draw_config(self) -> dict:
+        """Read draw config from config.yaml."""
+        cfg_path = Path.home() / ".hermes" / "config.yaml"
+        defaults = {"backend": "pollinations", "model": "flux", "axonhub_url": "", "axonhub_key": ""}
+        if not cfg_path.exists():
+            return defaults
+        try:
+            import yaml
+            with open(cfg_path) as f:
+                cfg = yaml.safe_load(f) or {}
+            draw = cfg.get("draw", {}) or {}
+            defaults.update({k: draw.get(k, v) for k, v in defaults.items()})
+            return defaults
+        except Exception:
+            return defaults
+
+    def _resolve_axonhub_credentials(self, draw_cfg: dict) -> tuple:
+        """Resolve AxonHub URL and key from draw config, falling back to custom_providers."""
+        url = draw_cfg.get("axonhub_url", "").rstrip("/")
+        key = draw_cfg.get("axonhub_key", "")
+        if url and key:
+            return url, key
+        # Fallback: custom_providers AxonHub entry
+        cfg_path = Path.home() / ".hermes" / "config.yaml"
+        try:
+            import yaml
+            with open(cfg_path) as f:
+                cfg = yaml.safe_load(f) or {}
+            for p in cfg.get("custom_providers", []):
+                if "axonhub" in (p.get("name", "") or "").lower() or "axonhub" in (p.get("base_url", "") or "").lower():
+                    url = url or (p.get("base_url", "") or "").rstrip("/")
+                    key = key or (p.get("api_key", "") or "")
+                    if url and key:
+                        return url, key
+        except Exception:
+            pass
+        return url, key
+
+    async def _draw_pollinations(self, prompt: str, model: str, size: str) -> str:
+        """Generate image via Pollinations shell script."""
+        script = Path.home() / ".hermes" / "scripts" / "pollinations-img.sh"
+        if not script.exists():
+            return "✗ pollinations-img.sh 脚本不存在"
+        w, _, h = size.partition("x")
+        w, h = w or "1024", h or "1024"
+        # Translate Chinese prompts for flux model
+        translated_prompt, was_translated = self._translate_to_english(prompt)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "bash", str(script), translated_prompt, model, w, h,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+            output = (stdout or b"").decode().strip()
+            if proc.returncode != 0:
+                err = (stderr or b"").decode().strip()
+                return f"✗ 生成失败: {err or output}"
+            # Extract file path from output
+            lines = output.splitlines()
+            img_path = ""
+            for line in lines:
+                if line.startswith("/") or line.startswith("IMAGE:"):
+                    img_path = line.replace("IMAGE:", "").strip()
+                    break
+            if not img_path:
+                img_path = lines[-1] if lines else ""
+            result_parts = [f"🎨 图片生成完成！模型: {model}"]
+            if was_translated:
+                result_parts.append(f"📝 已翻译: {translated_prompt[:100]}")
+            if img_path and Path(img_path).exists():
+                result_parts.append(f"MEDIA:{img_path}")
+            else:
+                result_parts.append(f"图片路径: {img_path}")
+            return "\n".join(result_parts)
+        except asyncio.TimeoutError:
+            return "✗ 生成超时（120s）"
+        except Exception as e:
+            return f"✗ 生成出错: {e}"
+
+    async def _draw_axonhub(self, prompt: str, model: str, size: str) -> str:
+        """Generate image via AxonHub /v1/images/generations using curl."""
+        draw_cfg = self._get_draw_config()
+        url, key = self._resolve_axonhub_credentials(draw_cfg)
+        if not url or not key:
+            return "✗ AxonHub 凭证未配置，请检查 draw.axonhub_url/key 或 custom_providers"
+        w, _, h = size.partition("x")
+        w, h = w or "1024", h or "1024"
+        translated_prompt, was_translated = self._translate_to_english(prompt)
+        import json as _json
+        body = _json.dumps({
+            "model": model,
+            "prompt": translated_prompt,
+            "size": f"{w}x{h}",
+            "n": 1,
+        })
+        full_url = f"{url}/images/generations"
+        output_dir = Path.home() / ".hermes" / "images"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        for attempt in range(3):
+            try:
+                tmp_path = "/tmp/hermes_draw_body.json"
+                with open(tmp_path, "w") as f:
+                    f.write(body)
+                proc = await asyncio.create_subprocess_exec(
+                    "curl", "-s", "-X", "POST", full_url,
+                    "-H", f"Authorization: Bearer {key}",
+                    "-H", "Content-Type: application/json",
+                    "-d", f"@{tmp_path}",
+                    "--max-time", "120",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=130)
+                resp_text = (stdout or b"").decode().strip()
+                data = _json.loads(resp_text)
+                if "error" in data:
+                    if attempt < 2:
+                        await asyncio.sleep(2)
+                        continue
+                    return f"✗ AxonHub 错误: {data['error']}"
+                # Extract image URL or base64
+                img_data = data.get("data", [{}])[0]
+                img_url = img_data.get("url", "")
+                b64 = img_data.get("b64_json", "")
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                out_path = str(output_dir / f"axonhub_{ts}.png")
+                if b64:
+                    import base64
+                    with open(out_path, "wb") as f:
+                        f.write(base64.b64decode(b64))
+                elif img_url:
+                    dl = await asyncio.create_subprocess_exec(
+                        "curl", "-sL", "-o", out_path, "--max-time", "30", img_url,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    await dl.communicate()
+                else:
+                    return "✗ AxonHub 未返回图片数据"
+                result_parts = [f"🎨 图片生成完成！模型: {model} (AxonHub)"]
+                if was_translated:
+                    result_parts.append(f"📝 已翻译: {translated_prompt[:100]}")
+                if Path(out_path).exists():
+                    result_parts.append(f"MEDIA:{out_path}")
+                return "\n".join(result_parts)
+            except _json.JSONDecodeError:
+                if attempt < 2:
+                    await asyncio.sleep(2)
+                    continue
+                return f"✗ AxonHub 响应解析失败: {resp_text[:200]}"
+            except asyncio.TimeoutError:
+                return "✗ AxonHub 生成超时（130s）"
+            except Exception as e:
+                if attempt < 2:
+                    await asyncio.sleep(2)
+                    continue
+                return f"✗ 生成出错: {e}"
+        return "✗ AxonHub 生成失败（重试3次）"
+
+    @staticmethod
+    def _translate_to_english(text: str) -> tuple:
+        """Translate Chinese text to English via MyMemory API for image models."""
+        _CJK_RE = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
+        if not _CJK_RE.search(text):
+            return text, False
+        try:
+            import urllib.request as _urllib
+            import urllib.parse as _parse
+            url = "https://api.mymemory.translated.net/get?" + _parse.urlencode(
+                {"q": text, "langpair": "zh|en"}
+            )
+            resp = _urllib.urlopen(url, timeout=10)
+            data = json.loads(resp.read())
+            translated = data.get("responseData", {}).get("translatedText", "")
+            if translated and translated.lower() != text.lower():
+                return translated, True
+        except Exception:
+            pass
+        return text, False
+
+    async def _handle_draw_command(self, event: MessageEvent) -> str:
+        """Handle /draw <prompt> [--model model] [--size WxH]."""
+        raw_args = event.get_command_args().strip()
+        if not raw_args:
+            return "用法: /draw <描述文字> [--model 模型名] [--size 宽x高]\n示例: /draw 一只可爱的猫在太空飞行 --model flux --size 1024x1024"
+
+        # Parse args
+        parts = raw_args.split()
+        prompt_parts = []
+        model = None
+        size = "1024x1024"
+        i = 0
+        while i < len(parts):
+            if parts[i] == "--model" and i + 1 < len(parts):
+                model = parts[i + 1]
+                i += 2
+            elif parts[i] == "--size" and i + 1 < len(parts):
+                size = parts[i + 1]
+                i += 2
+            else:
+                prompt_parts.append(parts[i])
+                i += 1
+        prompt = " ".join(prompt_parts)
+        if not prompt:
+            return "✗ 请提供图片描述文字"
+
+        draw_cfg = self._get_draw_config()
+        backend = draw_cfg.get("backend", "pollinations")
+        if not model:
+            model = draw_cfg.get("model", "flux")
+
+        if backend == "axonhub":
+            return await self._draw_axonhub(prompt, model, size)
+        else:
+            return await self._draw_pollinations(prompt, model, size)
+
+    async def _handle_drawmodel_command(self, event: MessageEvent) -> str:
+        """Handle /drawmodel [backend|model] — show or switch draw backend/model."""
+        raw_args = event.get_command_args().strip()
+        cfg_path = Path.home() / ".hermes" / "config.yaml"
+
+        # Known models per backend
+        pollinations_models = "zimage, flux, gptimage, gptimage-large, klein, kontext, wan-image"
+        axonhub_models = "flux-1.1-pro, flux.2-pro, flux.2-flex"
+
+        if not raw_args:
+            # Show current config
+            draw_cfg = self._get_draw_config()
+            backend = draw_cfg.get("backend", "pollinations")
+            model = draw_cfg.get("model", "flux")
+            lines = [
+                "🎨 **画图配置**",
+                f"后端: `{backend}`",
+                f"模型: `{model}`",
+                "",
+                "可用模型:",
+                f"  Pollinations: {pollinations_models}",
+                f"  AxonHub: {axonhub_models}",
+                "",
+                "用法:",
+                "  `/drawmodel pollinations` — 切换后端",
+                "  `/drawmodel flux` — 切换模型",
+                "  `/drawmodel pollinations:wan-image` — 同时切换",
+            ]
+            return "\n".join(lines)
+
+        # Parse switch args: "backend", "model", or "backend:model"
+        if ":" in raw_args:
+            parts = raw_args.split(":", 1)
+            new_backend = parts[0].strip()
+            new_model = parts[1].strip()
+        elif raw_args in ("pollinations", "axonhub"):
+            new_backend = raw_args
+            new_model = None
+        else:
+            new_backend = None
+            new_model = raw_args
+
+        # Update config.yaml
+        try:
+            import yaml
+            with open(cfg_path) as f:
+                cfg = yaml.safe_load(f) or {}
+            if "draw" not in cfg:
+                cfg["draw"] = {}
+            if new_backend:
+                cfg["draw"]["backend"] = new_backend
+            if new_model:
+                cfg["draw"]["model"] = new_model
+            with open(cfg_path, "w") as f:
+                yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
+
+            draw_cfg = self._get_draw_config()
+            return (
+                f"✅ 画图配置已更新\n"
+                f"后端: `{draw_cfg['backend']}`\n"
+                f"模型: `{draw_cfg['model']}`"
+            )
+        except Exception as e:
+            return f"✗ 保存配置失败: {e}"
 
     def _schedule_update_notification_watch(self) -> None:
         """Ensure a background task is watching for update completion."""
@@ -9362,15 +9773,21 @@ class GatewayRunner:
             # Map platform enum to the platform hint key the agent understands.
             # Platform.LOCAL ("local") maps to "cli"; others pass through as-is.
             platform_key = "cli" if source.platform == Platform.LOCAL else source.platform.value
-            
+
+            # Resolve persona: per-platform/per-bot ephemeral prompt overrides global one
+            ephemeral_prompt = self._load_ephemeral_system_prompt(
+                platform_key=platform_key,
+                bot_name=source.app_name,
+            )
+
             # Combine platform context, per-channel context, and the user-configured
             # ephemeral system prompt.
             combined_ephemeral = context_prompt or ""
             event_channel_prompt = (channel_prompt or "").strip()
             if event_channel_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + event_channel_prompt).strip()
-            if self._ephemeral_system_prompt:
-                combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
+            if ephemeral_prompt:
+                combined_ephemeral = (combined_ephemeral + "\n\n" + ephemeral_prompt).strip()
 
             # Re-read .env and config for fresh credentials (gateway is long-lived,
             # keys may change without restart).

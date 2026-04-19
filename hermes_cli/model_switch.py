@@ -857,6 +857,9 @@ def list_authenticated_providers(
 
         # Use curated list, falling back to models.dev if no curated list
         model_ids = curated.get(hermes_id, [])
+        # Skip providers with no curated models (e.g. groq used only for STT)
+        if not model_ids:
+            continue
         total = len(model_ids)
         top = model_ids[:max_models]
 
@@ -960,6 +963,9 @@ def list_authenticated_providers(
 
         # Use curated list — look up by Hermes slug, fall back to overlay key
         model_ids = curated.get(hermes_slug, []) or curated.get(pid, [])
+        # Skip providers with no curated models
+        if not model_ids:
+            continue
         total = len(model_ids)
         top = model_ids[:max_models]
 
@@ -1100,6 +1106,14 @@ def list_authenticated_providers(
                     "api_url": api_url,
                     "models": [],
                 }
+
+            models_dict = entry.get("models") or {}
+            if isinstance(models_dict, dict):
+                for mid in models_dict:
+                    mid_str = str(mid).strip()
+                    if mid_str and mid_str not in groups[slug]["models"]:
+                        groups[slug]["models"].append(mid_str)
+
             default_model = (entry.get("model") or "").strip()
             if default_model and default_model not in groups[slug]["models"]:
                 groups[slug]["models"].append(default_model)
@@ -1112,7 +1126,7 @@ def list_authenticated_providers(
                 "name": grp["name"],
                 "is_current": slug == current_provider,
                 "is_user_defined": True,
-                "models": grp["models"],
+                "models": grp["models"][:max_models],
                 "total_models": len(grp["models"]),
                 "source": "user-config",
                 "api_url": grp["api_url"],

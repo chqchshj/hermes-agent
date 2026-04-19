@@ -2167,6 +2167,7 @@ class BasePlatformAdapter(ABC):
         chat_topic: Optional[str] = None,
         user_id_alt: Optional[str] = None,
         chat_id_alt: Optional[str] = None,
+        app_name: Optional[str] = None,
         is_bot: bool = False,
     ) -> SessionSource:
         """Helper to build a SessionSource for this platform."""
@@ -2184,6 +2185,7 @@ class BasePlatformAdapter(ABC):
             chat_topic=chat_topic.strip() if chat_topic else None,
             user_id_alt=user_id_alt,
             chat_id_alt=chat_id_alt,
+            app_name=app_name,
             is_bot=is_bot,
         )
     

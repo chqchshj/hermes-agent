@@ -131,15 +131,7 @@ def _strip_yaml_frontmatter(content: str) -> str:
 # Constants
 # =========================================================================
 
-DEFAULT_AGENT_IDENTITY = (
-    "You are Hermes Agent, an intelligent AI assistant created by Nous Research. "
-    "You are helpful, knowledgeable, and direct. You assist users with a wide "
-    "range of tasks including answering questions, writing and editing code, "
-    "analyzing information, creative work, and executing actions via your tools. "
-    "You communicate clearly, admit uncertainty when appropriate, and prioritize "
-    "being genuinely useful over being verbose unless otherwise directed below. "
-    "Be targeted and efficient in your exploration and investigations."
-)
+DEFAULT_AGENT_IDENTITY = ""
 
 MEMORY_GUIDANCE = (
     "You have persistent memory across sessions. Save durable facts using the memory "
@@ -891,10 +883,11 @@ def _truncate_content(content: str, filename: str, max_chars: int = CONTEXT_FILE
     return head + marker + tail
 
 
-def load_soul_md() -> Optional[str]:
+def load_soul_md(platform: Optional[str] = None) -> Optional[str]:
     """Load SOUL.md from HERMES_HOME and return its content, or None.
 
-    Used as the agent identity (slot #1 in the system prompt).  When this
+    If platform is provided, first try loading SOUL_{platform}.md.
+    Used as the agent identity (slot #1 in the system prompt). When this
     returns content, ``build_context_files_prompt`` should be called with
     ``skip_soul=True`` so SOUL.md isn't injected twice.
     """
@@ -904,7 +897,22 @@ def load_soul_md() -> Optional[str]:
     except Exception as e:
         logger.debug("Could not ensure HERMES_HOME before loading SOUL.md: %s", e)
 
-    soul_path = get_hermes_home() / "SOUL.md"
+    home = get_hermes_home()
+
+    # 1. Try platform-specific soul file first
+    if platform:
+        platform_soul_path = home / f"SOUL_{platform}.md"
+        if platform_soul_path.exists():
+            try:
+                content = platform_soul_path.read_text(encoding="utf-8").strip()
+                if content:
+                    content = _scan_context_content(content, f"SOUL_{platform}.md")
+                    return _truncate_content(content, f"SOUL_{platform}.md")
+            except Exception as e:
+                logger.debug("Could not read %s: %s", platform_soul_path, e)
+
+    # 2. Fallback to default SOUL.md
+    soul_path = home / "SOUL.md"
     if not soul_path.exists():
         return None
     try:

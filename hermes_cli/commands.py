@@ -167,6 +167,12 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True, args_hint="<path>"),
     CommandDef("update", "Update Hermes Agent to the latest version", "Info",
                gateway_only=True),
+    CommandDef("syncmodel", "Sync models from API providers to config", "Info",
+               gateway_only=True),
+    CommandDef("draw", "Generate an image from text prompt", "Tools & Skills",
+               gateway_only=True, args_hint="<prompt> [--model m] [--size WxH]"),
+    CommandDef("drawmodel", "Show or switch image generation backend/model", "Tools & Skills",
+               gateway_only=True, args_hint="[backend|model]"),
     CommandDef("debug", "Upload debug report (system info + logs) and get shareable links", "Info"),
 
     # Exit
@@ -336,6 +342,21 @@ def _resolve_config_gates() -> set[str]:
     return result
 
 
+def _resolve_quick_commands() -> dict[str, Any]:
+    """Return quick_commands mapping from config.yaml.
+
+    Returns an empty dict on any error or when the config value is not a
+    mapping, mirroring gateway config loading's graceful behavior.
+    """
+    try:
+        from hermes_cli.config import read_raw_config
+        cfg = read_raw_config()
+    except Exception:
+        return {}
+    quick_commands = cfg.get("quick_commands", {})
+    return quick_commands if isinstance(quick_commands, dict) else {}
+
+
 def _is_gateway_available(cmd: CommandDef, config_overrides: set[str] | None = None) -> bool:
     """Check if *cmd* should appear in gateway surfaces (help, menus, mappings).
 
@@ -352,7 +373,14 @@ def _is_gateway_available(cmd: CommandDef, config_overrides: set[str] | None = N
     return False
 
 
-def gateway_help_lines() -> list[str]:
+def _quick_command_visible_on_platform(spec: Mapping[str, Any], platform: str | None = None) -> bool:
+    """Return whether a quick command should appear on a given platform surface."""
+    if platform == "telegram" and spec.get("telegram_visible") is False:
+        return False
+    return True
+
+
+def gateway_help_lines(platform: str | None = None) -> list[str]:
     """Generate gateway help text lines from the registry."""
     overrides = _resolve_config_gates()
     lines: list[str] = []
@@ -368,7 +396,79 @@ def gateway_help_lines() -> list[str]:
             alias_parts.append(f"`/{a}`")
         alias_note = f" (alias: {', '.join(alias_parts)})" if alias_parts else ""
         lines.append(f"`/{cmd.name}{args}` -- {cmd.description}{alias_note}")
+
+    for raw_name, spec in _resolve_quick_commands().items():
+        if not isinstance(raw_name, str) or not isinstance(spec, Mapping):
+            continue
+        if not _quick_command_visible_on_platform(spec, platform=platform):
+            continue
+        desc = spec.get("description") or _friendly_quick_command_description(raw_name)
+        if not isinstance(desc, str):
+            desc = raw_name
+        lines.append(f"`/{raw_name}` -- {desc}")
     return lines
+
+
+# Telegram 菜单中文描述映射
+_TG_DESCRIPTIONS: dict[str, str] = {
+    "new": "开始新会话",
+    "retry": "重试上一条消息",
+    "undo": "撤回上一组对话",
+    "title": "设置会话标题",
+    "branch": "分支会话（探索不同方向）",
+    "compress": "压缩会话上下文",
+    "rollback": "查看/恢复文件检查点",
+    "stop": "停止所有后台进程",
+    "approve": "批准待执行的危险命令",
+    "deny": "拒绝待执行的危险命令",
+    "background": "后台运行任务",
+    "btw": "临时追问（不使用工具）",
+    "queue": "排队等待下一轮处理",
+    "status": "查看会话状态",
+    "profile": "查看当前配置文件",
+    "sethome": "设为默认聊天频道",
+    "resume": "恢复历史会话",
+    "model": "切换会话模型",
+    "provider": "查看/切换供应商",
+    "personality": "切换人格模式",
+    "yolo": "切换 YOLO 模式",
+    "reasoning": "管理推理模式",
+    "fast": "切换快速模式",
+    "voice": "切换语音模式",
+    "reload_mcp": "重新加载 MCP 服务",
+    "commands": "浏览所有命令和技能",
+    "help": "查看帮助",
+    "restart": "优雅重启网关",
+    "usage": "查看用量和速率",
+    "insights": "查看用量分析",
+    "update": "更新 Hermes Agent",
+    "syncmodel": "同步模型列表",
+    "draw": "AI 绘图",
+    "drawmodel": "切换绘图模型",
+    "statusbar": "切换状态栏",
+    "verbose": "切换详细输出",
+    "skin": "切换界面主题",
+}
+
+_QUICK_COMMAND_FRIENDLY_DESCRIPTIONS: dict[str, str] = {
+    "goldprice": "金价更新",
+    "gold_price": "金价更新",
+    "minimax_usage": "Minimax 用量查询",
+    "sku": "商品查询",
+    "hy": "会员查询",
+    "dh": "单号查询",
+}
+
+
+def _friendly_quick_command_description(raw_name: str) -> str:
+    """Return a human-friendly Telegram description for a quick command."""
+    if raw_name in _QUICK_COMMAND_FRIENDLY_DESCRIPTIONS:
+        return _QUICK_COMMAND_FRIENDLY_DESCRIPTIONS[raw_name]
+
+    words = [part for part in raw_name.replace("-", "_").split("_") if part]
+    if not words:
+        return raw_name
+    return " ".join(word.upper() if word.isupper() else word.capitalize() for word in words)
 
 
 def telegram_bot_commands() -> list[tuple[str, str]]:
@@ -376,7 +476,7 @@ def telegram_bot_commands() -> list[tuple[str, str]]:
 
     Telegram command names cannot contain hyphens, so they are replaced with
     underscores.  Aliases are skipped -- Telegram shows one menu entry per
-    canonical command.
+    canonical command.  Descriptions are in Chinese.
     """
     overrides = _resolve_config_gates()
     result: list[tuple[str, str]] = []
@@ -385,7 +485,8 @@ def telegram_bot_commands() -> list[tuple[str, str]]:
             continue
         tg_name = _sanitize_telegram_name(cmd.name)
         if tg_name:
-            result.append((tg_name, cmd.description))
+            desc = _TG_DESCRIPTIONS.get(cmd.name, cmd.description)
+            result.append((tg_name, desc))
     return result
 
 
